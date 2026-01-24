@@ -127,53 +127,37 @@ def main(args, device):
             enable_running_stats(model)
 
             # --- DESAM: Calculate Variance Scales ---
-            # We perform individual forward/backward passes to get per-sample gradients
-            batch_size = train_data.shape[0]
-            param_grads = defaultdict(list)
-            
-            # Using a loop for simplicity. 
-            # Note: This increases training time significantly.
-            # To avoid affecting running stats, we could disable them, but we want gradients on the train mode.
-            # Since we re-run the full batch later, maybe we should suppress stats update here?
-            # However, standard practice for per-sample grad via loop is just to do it.
-            
-            # Save random state if sensitive? Cityscapes augmentation is deterministic per get_item usually if not using random transforms in forward.
-            # The model forward might have dropout.
-            
+            # We perform individual backward passes per task to get per-task gradients
             if args.desam:
-                # disable_running_stats(model) # Optional: prevent updating BN stats during this probe step
-                model.eval() # Use eval for probing variance to avoid dropout noise? Or train?
-                             # User code uses self.predict(xi) which usually implies checking behavior.
-                             # But we want gradient of LOSS.
-                             # Let's keep model.train() but potentially watch out for BN.
-                             # Actually userDESAM uses `super(DESAM, ...)` which likely implies training mode.
-                model.train()
+                task_grads = defaultdict(list)
                 
-                for k in range(batch_size):
-                    optimizer.zero_grad()
-                    
-                    td = train_data[k:k+1]
-                    tl = train_label[k:k+1]
-                    tdp = train_depth[k:k+1]
-                    
-                    # Forward
-                    p_k, _ = model(td, return_representation=True)
-                    
-                    l_k = torch.stack((
-                        calc_loss(p_k[0], tl, "semantic"),
-                        calc_loss(p_k[1], tdp, "depth"),
-                    )).mean()
-                    
-                    l_k.backward()
-                    
-                    for n, p in model.named_parameters():
-                        if p.grad is not None:
-                            param_grads[n].append(p.grad.detach().flatten()) 
+                # Ensure clean state
+                model.train()
+                optimizer.zero_grad()
+                
+                # Forward pass for gradients
+                tmp_pred, _ = model(train_data, return_representation=True)
+                
+                # Task 0: Semantic
+                loss_0 = calc_loss(tmp_pred[0], train_label, "semantic")
+                loss_0.backward(retain_graph=True)
+                for n, p in model.named_parameters():
+                    if p.grad is not None:
+                        task_grads[n].append(p.grad.detach().flatten()) 
+                optimizer.zero_grad()
+                
+                # Task 1: Depth
+                loss_1 = calc_loss(tmp_pred[1], train_depth, "depth")
+                loss_1.backward(retain_graph=False)
+                for n, p in model.named_parameters():
+                    if p.grad is not None:
+                        task_grads[n].append(p.grad.detach().flatten())
+                optimizer.zero_grad()
                 
                 desam_scales = {}
-                for n, grads in param_grads.items():
-                    if len(grads) > 0:
-                        stacked = torch.stack(grads) # (B, numel)
+                for n, grads in task_grads.items():
+                    if len(grads) > 1:
+                        stacked = torch.stack(grads) # (n_tasks, numel)
                         variance = torch.var(stacked, dim=0) + 1e-8
                         scales = torch.sqrt(variance)
                         s_mean = scales.mean()
@@ -182,9 +166,6 @@ def main(args, device):
                         else:
                             scales = torch.ones_like(scales)
                         desam_scales[n] = scales.view_as(dict(model.named_parameters())[n])
-                
-                optimizer.zero_grad()
-                enable_running_stats(model)
             # ----------------------------------------
 
             train_pred, features = model(train_data,

@@ -128,40 +128,45 @@ def main(args, device):
             enable_running_stats(model)
 
             # --- DESAM: Variance Calculation ---
-            desam_scales = {}
+            # We perform individual backward passes per task to get per-task gradients
             if args.desam:
-                # Per-sample gradient loop
-                batch_size = train_data.shape[0]
-                param_grads = defaultdict(list)
+                task_grads = defaultdict(list)
                 
-                # Use model in training mode but maybe suppress stats? 
-                # Keeping default behavior for simplicity.
+                # Ensure clean state
+                model.train()
+                optimizer.zero_grad()
                 
-                for k in range(batch_size):
-                    optimizer.zero_grad()
-                    td = train_data[k:k+1]
-                    tl = train_label[k:k+1]
-                    tdp = train_depth[k:k+1]
-                    tn = train_normal[k:k+1]
-                    
-                    # Forward
-                    tp, _ = model(td, return_representation=True)
-                    
-                    l_k = torch.stack((
-                        calc_loss(tp[0], tl, "semantic"),
-                        calc_loss(tp[1], tdp, "depth"),
-                        calc_loss(tp[2], tn, "normal"),
-                    )).mean()
-                    
-                    l_k.backward()
-                    
-                    for n, p in model.named_parameters():
-                        if p.grad is not None:
-                            param_grads[n].append(p.grad.detach().flatten())
+                # Forward pass for gradients
+                tmp_pred, _ = model(train_data, return_representation=True)
                 
-                for n, grads in param_grads.items():
-                    if len(grads) > 0:
-                        stacked = torch.stack(grads)
+                # Task 0: Semantic
+                loss_0 = calc_loss(tmp_pred[0], train_label, "semantic")
+                loss_0.backward(retain_graph=True)
+                for n, p in model.named_parameters():
+                    if p.grad is not None:
+                        task_grads[n].append(p.grad.detach().flatten()) 
+                optimizer.zero_grad()
+                
+                # Task 1: Depth
+                loss_1 = calc_loss(tmp_pred[1], train_depth, "depth")
+                loss_1.backward(retain_graph=True)
+                for n, p in model.named_parameters():
+                    if p.grad is not None:
+                        task_grads[n].append(p.grad.detach().flatten()) 
+                optimizer.zero_grad()
+                
+                # Task 2: Normal
+                loss_2 = calc_loss(tmp_pred[2], train_normal, "normal")
+                loss_2.backward(retain_graph=False)
+                for n, p in model.named_parameters():
+                    if p.grad is not None:
+                        task_grads[n].append(p.grad.detach().flatten())
+                optimizer.zero_grad()
+                
+                desam_scales = {}
+                for n, grads in task_grads.items():
+                    if len(grads) > 1:
+                        stacked = torch.stack(grads) # (n_tasks, numel)
                         variance = torch.var(stacked, dim=0) + 1e-8
                         scales = torch.sqrt(variance)
                         s_mean = scales.mean()
@@ -170,8 +175,6 @@ def main(args, device):
                         else:
                             scales = torch.ones_like(scales)
                         desam_scales[n] = scales.view_as(dict(model.named_parameters())[n])
-                
-                optimizer.zero_grad()
             # -----------------------------------
 
             train_pred, features = model(train_data,

@@ -171,29 +171,25 @@ def main(
             # --- DESAM: Variance Calculation ---
             desam_scales = {}
             if desam:
-                # Per-sample gradient loop
-                # PyG Batch to data list
-                data_list = data.to_data_list()
-                param_grads = defaultdict(list)
+                task_grads = defaultdict(list)
                 
-                # Careful with BatchNorm if present (Net in models.py usually has NNConv etc)
-                # disable_running_stats(model)
+                # Forward for gradients
+                out_all, _ = model(data, return_representation=True)
                 
-                for k_data in data_list:
+                for t_idx in range(n_tasks):
                     optimizer.zero_grad()
-                    # k_data is on device
-                    out_k, _ = model(k_data, return_representation=True)
-                    # out_k: (1, n_tasks). y: (1, n_tasks)
-                    
-                    l_k = F.mse_loss(out_k, k_data.y, reduction="none").mean()
-                    l_k.backward()
+                    # loss per task
+                    l_task = F.mse_loss(out_all[:, t_idx], data.y[:, t_idx], reduction="none").mean()
+                    l_task.backward(retain_graph=True)
                     
                     for n, p in model.named_parameters():
                         if p.grad is not None:
-                            param_grads[n].append(p.grad.detach().flatten())
+                            task_grads[n].append(p.grad.detach().flatten())
                 
-                for n, grads in param_grads.items():
-                   if len(grads) > 0:
+                optimizer.zero_grad()
+
+                for n, grads in task_grads.items():
+                   if len(grads) > 1:
                        stacked = torch.stack(grads)
                        variance = torch.var(stacked, dim=0) + 1e-8
                        scales = torch.sqrt(variance)
@@ -203,9 +199,6 @@ def main(
                        else:
                            scales = torch.ones_like(scales)
                        desam_scales[n] = scales.view_as(dict(model.named_parameters())[n])
-                
-                optimizer.zero_grad()
-                # enable_running_stats(model)
             # -----------------------------------
 
             # Get the average gradient
