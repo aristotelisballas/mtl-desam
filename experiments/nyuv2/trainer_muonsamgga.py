@@ -459,11 +459,11 @@ if __name__ == "__main__":
     # MuonGGASAM settings
     parser.add_argument("--rho",
                         type=float,
-                        default=0.05,
+                        default=0.0005,
                         help="Rho for pertubation in MuonGGASAM.")
     parser.add_argument("--gga_l_gamma",
                         type=float,
-                        default=1.0,
+                        default=0.0001,
                         help="Gamma scalar for dynamic domain noise (GGA-L).")
 
     parser.add_argument("--wandb_project",
